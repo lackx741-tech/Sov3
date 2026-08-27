@@ -47,8 +47,24 @@ api_keys) + Redis (cache, pub/sub, nonces).
 
 ```bash
 npm install
-npm run db:up            # PostgreSQL 15 + Redis 7 via docker compose
-npm run dev:orchestrator # etc. — see each package README
+npm run db:start         # start docker daemon + PostgreSQL 15 + Redis 7 via docker compose
+npm run orchestrator     # Express API on :4000
+npm run compile          # compile engine on :4100
+npm run scanner          # chain-state reads (idle without SCAN_TARGETS)
+npm run relayer          # transaction relay (needs RPC_URL + optional RELAYER_PRIVATE_KEY)
+npm run telegram         # operator-only monitoring alerts (needs bot token/chat id)
+npm run dev              # React console on :5173 (proxies /api and /bundles)
 ```
+
+### End-to-end smoke test
+
+With Postgres + Redis up and orchestrator (:4000) + compile (:4100) running:
+
+```bash
+node infra/e2e-test.mjs
+```
+
+It exercises login → domain registration → contract registration → campaign
+creation → compile trigger → bundle fetch (domain-locked) → status uplift.
 
 See `README.md` for the full operational spec (kept mostly for reference).

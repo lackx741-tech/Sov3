@@ -19,7 +19,8 @@
     "compile": "npm run dev --workspace=packages/compile",
     "telegram": "npm run dev --workspace=packages/telegram",
     "db:up": "docker compose -f infra/docker-compose.yml up -d",
-    "db:down": "docker compose -f infra/docker-compose.yml down"
+    "db:down": "docker compose -f infra/docker-compose.yml down",
+    "db:start": "bash infra/start-docker.sh && npm run db:up"
   },
   "license": "MIT"
 }

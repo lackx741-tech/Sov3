@@ -21,6 +21,10 @@ const config = {
   compileBase: process.env.COMPILE_BASE_URL ?? 'http://127.0.0.1:4100',
 };
 
+// Wrap an async route handler so thrown errors go to Express's error middleware
+// instead of becoming an unhandled rejection that crashes the process (Express 4).
+const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 const app = express();
 app.use(helmet());
 app.use(cors());
@@ -58,7 +62,7 @@ async function auth(req, res, next) {
 }
 
 // --- Auth ---
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', ah(async (req, res) => {
   const { email, password } = req.body || {};
   const { rows } = await query('SELECT * FROM users WHERE email = $1', [email]);
   const user = rows[0];
@@ -70,9 +74,9 @@ app.post('/api/auth/login', async (req, res) => {
       : await bcrypt.compare(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: 'invalid credentials' });
   res.json({ token: signToken(user), user: { id: user.id, email: user.email, role: user.role } });
-});
+}));
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', ah(async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'email and password required' });
   const hash = await bcrypt.hash(password, 10);
@@ -87,15 +91,15 @@ app.post('/api/auth/register', async (req, res) => {
     if (e.code === '23505') return res.status(409).json({ error: 'email exists' });
     throw e;
   }
-});
+}));
 
 // --- Domains (operator-owned origins) ---
-app.get('/api/domains', auth, async (_req, res) => {
+app.get('/api/domains', auth, ah(async (_req, res) => {
   const { rows } = await query('SELECT * FROM domains ORDER BY created_at DESC');
   res.json(rows);
-});
+}));
 
-app.post('/api/domains', auth, async (req, res) => {
+app.post('/api/domains', auth, ah(async (req, res) => {
   const { origin } = req.body || {};
   if (!origin) return res.status(400).json({ error: 'origin required' });
   try {
@@ -108,15 +112,15 @@ app.post('/api/domains', auth, async (req, res) => {
     if (e.code === '23505') return res.status(409).json({ error: 'origin exists' });
     throw e;
   }
-});
+}));
 
 // --- Contracts (operator-owned contracts) ---
-app.get('/api/contracts', auth, async (_req, res) => {
+app.get('/api/contracts', auth, ah(async (_req, res) => {
   const { rows } = await query('SELECT * FROM contracts ORDER BY created_at DESC');
   res.json(rows);
-});
+}));
 
-app.post('/api/contracts', auth, async (req, res) => {
+app.post('/api/contracts', auth, ah(async (req, res) => {
   const { address, chainId, name, abi } = req.body || {};
   if (!address || !chainId) return res.status(400).json({ error: 'address and chainId required' });
   const { rows } = await query(
@@ -124,10 +128,10 @@ app.post('/api/contracts', auth, async (req, res) => {
     [address, chainId, name, JSON.stringify(abi ?? {})],
   );
   res.status(201).json(rows[0]);
-});
+}));
 
 // --- API key vault ---
-app.post('/api/keys', auth, async (req, res) => {
+app.post('/api/keys', auth, ah(async (req, res) => {
   const { name } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
   if (!config.VAULT_KEY) return res.status(500).json({ error: 'VAULT_KEY not configured' });
@@ -139,22 +143,22 @@ app.post('/api/keys', auth, async (req, res) => {
   );
   // The plaintext is shown once to the operator at creation.
   res.status(201).json({ ...rows[0], key });
-});
+}));
 
-app.get('/api/keys', auth, async (_req, res) => {
+app.get('/api/keys', auth, ah(async (_req, res) => {
   const { rows } = await query(
     "SELECT id,name,created_at,revoked_at FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at DESC",
   );
   res.json(rows);
-});
+}));
 
 // --- Campaigns ---
-app.get('/api/campaigns', auth, async (_req, res) => {
+app.get('/api/campaigns', auth, ah(async (_req, res) => {
   const { rows } = await query('SELECT * FROM campaigns ORDER BY created_at DESC');
   res.json(rows);
-});
+}));
 
-app.post('/api/campaigns', auth, async (req, res) => {
+app.post('/api/campaigns', auth, ah(async (req, res) => {
   const { name, contractId, chainId, domainId, protocol, config } = req.body || {};
   const { rows } = await query(
     `INSERT INTO campaigns (name, contract_id, chain_id, domain_id, protocol, config, created_by)
@@ -162,9 +166,9 @@ app.post('/api/campaigns', auth, async (req, res) => {
     [name, contractId, chainId, domainId, protocol ?? 'reown', JSON.stringify(config ?? {}), req.user.sub],
   );
   res.status(201).json(rows[0]);
-});
+}));
 
-app.post('/api/campaigns/:id/compile', auth, async (req, res) => {
+app.post('/api/campaigns/:id/compile', auth, ah(async (req, res) => {
   const { rows } = await query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
   const campaign = rows[0];
   if (!campaign) return res.status(404).json({ error: 'campaign not found' });
@@ -175,6 +179,19 @@ app.post('/api/campaigns/:id/compile', auth, async (req, res) => {
   // through the COMPILE_GENERATED event (persisted to compile_logs by telegram/compile side).
   await mesh.publish(TOPICS.COMPILE_GENERATED, { campaignId: campaign.id });
   res.json({ ok: true, message: 'compile requested' });
+}));
+
+// Central error handler: return a 4xx/5xx instead of crashing the process.
+// eslint-disable-next-line no-unused-vars
+app.use((err, _req, res, _next) => {
+  const status = err.code === '23505' ? 409 : err.status || 500;
+  console.error('[orchestrator] error:', err.message);
+  res.status(status).json({ error: status >= 500 ? 'internal error' : err.message });
+});
+
+// Backstop: a stray async error should never take down the service.
+process.on('unhandledRejection', (reason) => {
+  console.error('[orchestrator] unhandledRejection:', reason);
 });
 
 const port = Number(process.env.PORT ?? 4000);

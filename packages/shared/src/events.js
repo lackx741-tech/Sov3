@@ -7,6 +7,8 @@ const TOPICS = {
   RELAY_CONFIRMED: 'relay.confirmed',
   RELAY_FAILURE: 'relay.failure',
   CAMPAIGN_DEPLOYED: 'campaign.deployed',
+  RELAY_BROADCAST_REQUEST: 'relay.broadcast.request', // client-signed raw tx, user-authorized
+  RELAY_RELAY_REQUEST: 'relay.relay.request', // operator-owned wallet broadcast request
 };
 
 class EventMesh {

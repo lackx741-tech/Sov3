@@ -1,0 +1,13 @@
+{
+  "name": "@aegis/telegram",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node src/index.js"
+  },
+  "dependencies": {
+    "@aegis/shared": "0.1.0",
+    "dotenv": "^16.4.5"
+  }
+}
