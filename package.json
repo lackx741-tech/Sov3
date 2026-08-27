@@ -1,0 +1,25 @@
+{
+  "name": "aegis-void",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AEGIS — self-hosted web3 wallet-connect dashboard, transaction relay, monitoring, and compile tooling. Runs only on domains the operator owns.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev": "npm run dev --workspace=packages/console",
+    "orchestrator": "npm run dev --workspace=packages/orchestrator",
+    "scanner": "npm run dev --workspace=packages/scanner",
+    "relayer": "npm run dev --workspace=packages/relayer",
+    "compile": "npm run dev --workspace=packages/compile",
+    "telegram": "npm run dev --workspace=packages/telegram",
+    "db:up": "docker compose -f infra/docker-compose.yml up -d",
+    "db:down": "docker compose -f infra/docker-compose.yml down"
+  },
+  "license": "MIT"
+}

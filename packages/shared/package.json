@@ -1,0 +1,9 @@
+{
+  "name": "@aegis/shared",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "dependencies": {
+    "ioredis": "^5.4.1"
+  }
+}
