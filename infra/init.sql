@@ -66,6 +66,19 @@ CREATE TABLE IF NOT EXISTS api_keys (
   revoked_at TIMESTAMPTZ
 );
 
+-- Relay jobs: audit trail of user-consented broadcasts routed through the relayer.
+CREATE TABLE IF NOT EXISTS relay_jobs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  campaign_id UUID REFERENCES campaigns(id),
+  tx_hash TEXT,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | broadcasting | confirmed | failed
+  origin TEXT,
+  function_name TEXT,
+  error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- An operator who will administer the system (password: change-me)
 INSERT INTO users (email, password_hash)
 VALUES ('operator@example.com', 'CHANGE_ME_PBKDF2_SHA256')

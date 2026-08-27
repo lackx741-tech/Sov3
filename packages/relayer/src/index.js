@@ -9,6 +9,8 @@ const RPC_URL = process.env.RPC_URL ?? 'http://127.0.0.1:8545';
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 const CONFIRMATIONS = Number(process.env.RELAY_CONFIRMATIONS ?? 1);
 const MAX_FEE_CAP_GWEI = Number(process.env.MAX_FEE_CAP_GWEI ?? 500);
+const MAX_BROADCAST_RETRIES = Number(process.env.RELAY_MAX_RETRIES ?? 3);
+const RETRY_BASE_MS = Number(process.env.RELAY_RETRY_BASE_MS ?? 500);
 const provider = new JsonRpcProvider(RPC_URL);
 const cache = new Redis(REDIS_URL);
 const mesh = new EventMesh(REDIS_URL);
@@ -16,6 +18,33 @@ const mesh = new EventMesh(REDIS_URL);
 // Relayer keys come ONLY from the environment / KMS / HSM. Never from source or DB.
 // An operator-owned wallet may be configured for operator-initiated broadcasts.
 const relayerKey = process.env.RELAYER_PRIVATE_KEY || null;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Best-effort broadcast with linear backoff. Transient JSON-RPC/network errors are
+// retried up to MAX_BROADCAST_RETRIES; hard chain rejections (e.g. invalid nonce,
+// insufficient funds, gas too low) are surfaced immediately since retrying them is
+// pointless and could burn the nonce.
+function isTransient(e) {
+  const m = (e?.shortMessage ?? e?.message ?? '').toLowerCase();
+  return /(timeout|econnreset|econnrefused|server error|rate limit|too many requests|network error)/.test(m);
+}
+
+async function broadcastWithRetry(fn) {
+  let lastErr;
+  for (let attempt = 0; attempt <= MAX_BROADCAST_RETRIES; attempt += 1) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (attempt === MAX_BROADCAST_RETRIES || !isTransient(e)) throw e;
+      const delay = RETRY_BASE_MS * 2 ** attempt;
+      console.warn(`[relayer] transient error, retrying in ${delay}ms (${attempt + 1}/${MAX_BROADCAST_RETRIES})`, e.message);
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
 
 async function nextNonce(address) {
   // Atomic nonce retrieval/increment via Redis to prevent replays across workers.
@@ -35,16 +64,17 @@ async function releaseNonce(address, reserve) {
 
 // Broadcast a user-signed raw transaction (the user authorizes in their own wallet).
 async function broadcastRaw(rawTx) {
-  const sent = await provider.broadcastTransaction(rawTx);
-  const receipt = await sent.wait(CONFIRMATIONS);
+  const sent = await broadcastWithRetry(() => provider.broadcastTransaction(rawTx));
+  const receipt = await broadcastWithRetry(() => sent.wait(CONFIRMATIONS));
   return { txHash: sent.hash, receipt };
 }
 
 // Build, sign (with the operator-owned relayer key), and broadcast a transaction.
-async function relayTx({ to, chainId, value, data, maxFeePerGasGwei }) {
+async function relayTx({ to, chainId, value, data, maxFeePerGasGwei, gasLimit }) {
   if (!relayerKey) throw new Error('RELAYER_PRIVATE_KEY not configured for operator broadcasts');
   const wallet = new Wallet(relayerKey, provider);
-  const nonce = await nextNonce(await wallet.getAddress());
+  const from = await wallet.getAddress();
+  const nonce = await nextNonce(from);
   const feeCapGwei = Math.min(maxFeePerGasGwei ?? 50, MAX_FEE_CAP_GWEI);
   const fee = {
     maxFeePerGas: parseUnits(String(feeCapGwei), 'gwei'),
@@ -59,16 +89,35 @@ async function relayTx({ to, chainId, value, data, maxFeePerGasGwei }) {
     chainId,
     ...fee,
   };
+  // Estimate gas with a fallback (21000 for plain transfers). Without a gasLimit
+  // an EIP-1559 tx is built with gas=0, which miners reject ("intrinsic gas too low").
+  let limit = gasLimit;
+  if (!limit) {
+    try {
+      limit = await provider.estimateGas({ ...tx, from });
+    } catch {
+      limit = data && data !== '0x' ? 200_000 : 21_000;
+    }
+  }
+  tx.gasLimit = limit;
   const signed = await wallet.signTransaction(tx);
-  const sent = await provider.broadcastTransaction(signed);
-  const receipt = await sent.wait(CONFIRMATIONS);
-  return { txHash: sent.hash, from: await wallet.getAddress(), nonce, receipt };
+  const sent = await broadcastWithRetry(() => provider.broadcastTransaction(signed));
+  const receipt = await broadcastWithRetry(() => sent.wait(CONFIRMATIONS));
+  return { txHash: sent.hash, from, nonce, receipt };
 }
 
 // Idempotency guard: ignore duplicate broadcast requests.
 async function claim(id) {
   const ok = await cache.set(`relay:claimed:${id}`, '1', 'EX', 600, 'NX');
   return ok === 'OK';
+}
+
+function baseMeta(payload) {
+  return {
+    campaignId: payload.campaignId ?? null,
+    origin: payload.origin ?? null,
+    functionName: payload.functionName ?? null,
+  };
 }
 
 // The compile/console layer publishes user-signed raw transactions, signing on the wallet side.
@@ -86,11 +135,13 @@ mesh.subscribe(TOPICS.RELAY_BROADCAST_REQUEST, async (payload) => {
     const { txHash, receipt } = await broadcastRaw(rawTx);
     await mesh.publish(TOPICS.RELAY_CONFIRMED, {
       id, txHash, from: receipt.from, blockNumber: receipt.blockNumber, status: 'confirmed',
-      ts: new Date().toISOString(),
+      ts: new Date().toISOString(), ...baseMeta(payload),
     });
     console.log('[relayer] confirmed', txHash);
   } catch (e) {
-    await mesh.publish(TOPICS.RELAY_FAILURE, { id, reason: e.shortMessage ?? e.message });
+    await mesh.publish(TOPICS.RELAY_FAILURE, {
+      id, reason: e.shortMessage ?? e.message, ...baseMeta(payload),
+    });
     console.error('[relayer] failure', e.message);
   }
 });
@@ -104,12 +155,18 @@ mesh.subscribe(TOPICS.RELAY_RELAY_REQUEST, async (payload) => {
     await mesh.publish(TOPICS.RELAY_CONFIRMED, {
       id, txHash: res.txHash, from: res.from, nonce: res.nonce,
       blockNumber: res.receipt.blockNumber, status: 'confirmed', ts: new Date().toISOString(),
+      ...baseMeta(payload),
     });
     console.log('[relayer] relayed', res.txHash);
   } catch (e) {
-    await mesh.publish(TOPICS.RELAY_FAILURE, { id, reason: e.shortMessage ?? e.message });
+    await mesh.publish(TOPICS.RELAY_FAILURE, {
+      id, reason: e.shortMessage ?? e.message, ...baseMeta(payload),
+    });
     console.error('[relayer] failure', e.message);
   }
 });
 
+// Wait until subscriptions are live on Redis before announcing readiness so a
+// publisher doesn't race ahead and have its message dropped.
+await mesh.ensureSubscribed();
 console.log(`[relayer] connected to ${RPC_URL} (confirmations=${CONFIRMATIONS})`);

