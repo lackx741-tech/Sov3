@@ -3,12 +3,14 @@ import helmet from 'helmet';
 import pg from 'pg';
 import { EventMesh, TOPICS } from '@aegis/shared';
 import dotenv from 'dotenv';
+import { buildEmbed } from './generate-embed.js';
 
 dotenv.config();
 
 const DB_URL = process.env.POSTGRES_URL ?? process.env.DATABASE_URL;
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 const PUBLIC_ORIGIN = process.env.PUBLIC_ORIGIN ?? '*';
+const ORCH_BASE = process.env.ORCHESTRATOR_URL ?? 'http://127.0.0.1:4000';
 const pool = new pg.Pool({ connectionString: DB_URL });
 const mesh = new EventMesh(REDIS_URL);
 
@@ -16,60 +18,65 @@ const app = express();
 app.use(helmet());
 app.use(express.json());
 
-// Compile a wallet-connect embed script for an operator-owned campaign. Only serves
-// bundles tied to domains the operator has whitelisted; refuses anything else.
-function buildBundle({ campaign, contract, domain, protocol }) {
-  const sdkImport =
-    protocol === 'reown'
-      ? `import { createAppKit } from '@reown/appkit'`
-      : protocol === 'rainbowkit'
-        ? `import { RainbowKitProvider, ConnectButton } from '@rainbow-me/rainbowkit'`
-        : `createWalletConnectLegacyProvider()`;
-  const domainOk = `location.hostname === ${JSON.stringify(domain)} ||
-    location.origin === ${JSON.stringify(domain)}`;
-
-  return `/* AEGIS embed script — generated for campaign ${campaign.id} */
-/* Runs ONLY on the operator-owned domain: ${domain} */
-(function () {
-  if (!(${domainOk})) {
-    console.warn('[aegis] refused: not on whitelisted domain');
-    return;
-  }
-  const contractAddress = ${JSON.stringify(contract?.address ?? null)};
-  const chainId = ${JSON.stringify(campaign.chain_id ?? null)};
-  // ${sdkImport}
-  // Wallet-connect initialization for the operator's own site.
-  // Visitors connect their own wallet, review the tx in their wallet UI, and sign
-  // only what they approve. The backend never receives or stores user private keys.
-  document.dispatchEvent(new CustomEvent('aegis:ready', {
-    detail: { campaign: ${JSON.stringify(campaign.id)}, contractAddress, chainId, protocol: ${JSON.stringify(protocol)} }
-  }));
-})();
-`;
-}
-
-app.get('/bundles/:campaignId.js', async (req, res) => {
+async function loadCampaignBundleData(campaignId) {
   const { rows } = await pool.query(
-    `SELECT c.*, c.name AS campaign_name, k.id AS contract_id, k.name AS contract_name,
-            k.address AS contract_address, d.origin AS domain_origin
+    `SELECT c.*, c.name AS campaign_name,
+            k.id AS contract_id, k.name AS contract_name, k.address AS contract_address, k.abi AS contract_abi,
+            d.origin AS domain_origin
        FROM campaigns c
        LEFT JOIN contracts k ON k.id = c.contract_id
        LEFT JOIN domains d ON d.id = c.domain_id
       WHERE c.id = $1`,
-    [req.params.campaignId],
+    [campaignId],
   );
-  const campaign = rows[0];
-  if (!campaign) return res.status(404).json({ error: 'not found' });
-  if (!campaign.domain_origin) return res.status(400).json({ error: 'campaign has no whitelisted domain' });
+  return rows[0] ?? null;
+}
 
-  const js = buildBundle({
+// Build the embed script for a campaign using its persisted config + contract.
+async function embedForCampaign(campaignId) {
+  const campaign = await loadCampaignBundleData(campaignId);
+  if (!campaign) {
+    const err = new Error('campaign not found');
+    err.status = 404;
+    throw err;
+  }
+  if (!campaign.domain_origin) {
+    const err = new Error('campaign has no whitelisted domain');
+    err.status = 400;
+    throw err;
+  }
+  const cfg = campaign.config ?? {};
+  const abi = (cfg.abi?.length ? cfg.abi : campaign.contract_abi) ?? [];
+  const protocol = cfg.protocol ?? campaign.protocol ?? 'reown';
+  const endpoint = cfg.endpoint ?? `${ORCH_BASE}/api/relay/broadcast`;
+  const statusEndpoint = cfg.statusEndpoint ?? `${ORCH_BASE}/api/campaigns/{id}/relay/{jobId}`;
+
+  return buildEmbed({
     campaign: { id: campaign.id, chain_id: campaign.chain_id },
     contract: campaign.contract_address ? { address: campaign.contract_address } : null,
     domain: campaign.domain_origin,
-    protocol: campaign.protocol,
+    protocol,
+    cfg: { ...cfg, abi },
+    endpoint,
+    statusEndpoint,
   });
-  res.type('application/javascript').send(js);
-});
+}
+
+const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// Serve the generated bundle (used as the inline script on the operator's site).
+app.get('/bundles/:campaignId.js', ah(async (req, res) => {
+  const js = await embedForCampaign(req.params.campaignId);
+  res.type('application/javascript').set('Cache-Control', 'no-store').send(js);
+}));
+
+// Preview endpoint (JSON + raw) so the console Compile Lab shows exactly what
+// the bundle endpoint will serve.
+app.get('/api/campaigns/:campaignId/preview', ah(async (req, res) => {
+  const js = await embedForCampaign(req.params.campaignId);
+  if (req.query.raw === '1') return res.type('application/javascript').send(js);
+  res.json({ script: js });
+}));
 
 // The orchestrator publishes COMPILE_GENERATED when the operator triggers a compile.
 mesh.subscribe(TOPICS.COMPILE_GENERATED, async ({ campaignId }) => {
@@ -87,6 +94,18 @@ mesh.subscribe(TOPICS.COMPILE_GENERATED, async ({ campaignId }) => {
   } catch (e) {
     console.error('[compile] error', e.message);
   }
+});
+
+// Central error handler: return 4xx/5xx instead of crashing the process.
+// eslint-disable-next-line no-unused-vars
+app.use((err, _req, res, _next) => {
+  const status = err.status || 500;
+  console.error('[compile] error:', err.message);
+  res.status(status).json({ error: err.message });
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[compile] unhandledRejection:', reason);
 });
 
 const port = Number(process.env.PORT ?? 4100);

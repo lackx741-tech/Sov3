@@ -20,7 +20,12 @@
     "telegram": "npm run dev --workspace=packages/telegram",
     "db:up": "docker compose -f infra/docker-compose.yml up -d",
     "db:down": "docker compose -f infra/docker-compose.yml down",
-    "db:start": "bash infra/start-docker.sh && npm run db:up"
+    "db:start": "bash infra/start-docker.sh && npm run db:up",
+    "test": "vitest run"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "ganache": "^7.9.2",
+    "vitest": "^4.1.11"
+  }
 }

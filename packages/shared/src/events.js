@@ -16,6 +16,20 @@ class EventMesh {
     this.pub = new Redis(url, { maxRetriesPerRequest: null });
     this.sub = new Redis(url, { maxRetriesPerRequest: null });
     this.localHandlers = new Map();
+    this.subscribed = new Map(); // topic -> promise resolving when SUBSCRIBE is live
+    // Attach the message listener exactly once. Attaching it per-subscribe-call
+    // would invoke handlers twice for every published message.
+    this.sub.on('message', (channel, message) => {
+      const handlers = this.localHandlers.get(channel);
+      if (!handlers) return;
+      let data;
+      try {
+        data = JSON.parse(message);
+      } catch {
+        return;
+      }
+      for (const h of handlers) h(data, channel);
+    });
   }
 
   async publish(topic, payload) {
@@ -25,24 +39,28 @@ class EventMesh {
   subscribe(topic, handler) {
     if (!this.localHandlers.has(topic)) {
       this.localHandlers.set(topic, new Set());
-      this.sub.subscribe(topic, (err) => {
-        if (err) throw err;
-      });
-      this.sub.on('message', (channel, message) => {
-        const handlers = this.localHandlers.get(channel);
-        if (!handlers) return;
-        let data;
-        try {
-          data = JSON.parse(message);
-        } catch {
-          return;
-        }
-        for (const h of handlers) h(data, channel);
-      });
     }
     const set = this.localHandlers.get(topic);
     set.add(handler);
+    if (!this.subscribed.has(topic)) {
+      this.subscribed.set(
+        topic,
+        new Promise((resolve, reject) => {
+          this.sub.subscribe(topic, (err) => {
+            if (err) reject(err);
+            else resolve();
+          });
+        }),
+      );
+    }
     return () => set.delete(handler);
+  }
+
+  // Resolve once all previously-registered topic subscriptions are live on Redis.
+  // Callers that publish right after subscribing should await this to avoid the
+  // pub/sub race where messages sent before SUBSCRIBE are dropped.
+  async ensureSubscribed() {
+    await Promise.all([...this.subscribed.values()]);
   }
 
   async close() {
