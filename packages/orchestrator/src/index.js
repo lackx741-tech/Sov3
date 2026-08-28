@@ -74,6 +74,36 @@ mesh.subscribe(TOPICS.RELAY_FAILURE, async (p) => {
   ).catch((e) => console.error('[orchestrator] relay failure update failed', e.message));
 });
 
+// Scan intelligence: persist the latest reading per target so the console can show it.
+ const ENSURE_SCAN_INTEL = `CREATE TABLE IF NOT EXISTS scan_intel (
+   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+   target_type TEXT NOT NULL,
+   target_address TEXT NOT NULL,
+   payload JSONB NOT NULL,
+   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+   UNIQUE (target_type, target_address)
+ )`;
+ void query(ENSURE_SCAN_INTEL).catch((e) => console.error('[orchestrator] ensure scan_intel failed', e.message));
+
+ mesh.subscribe(TOPICS.SCAN_INTEL, async (p) => {
+   const type = p?.type ?? p?.target_type ?? (p?.balance ? 'balance' : null);
+   const addr = p?.address ?? p?.target_address ?? null;
+   if (!type || !addr) return;
+   await query(
+     `INSERT INTO scan_intel (target_type, target_address, payload) VALUES ($1,$2,$3)
+       ON CONFLICT (target_type, target_address) DO UPDATE SET payload=EXCLUDED.payload, created_at=now()`,
+     [type, addr, JSON.stringify(p)],
+   ).catch((e) => console.error('[orchestrator] scan_intel upsert failed', e.message));
+ });
+
+ // Audit trail for operator alerts (Telegram ALPHA/ECHO classes etc.).
+ async function logAlert(alertClass, content) {
+   await query(
+     'INSERT INTO telegram_alerts (alert_class, content) VALUES ($1,$2)',
+     [alertClass, typeof content === 'string' ? content : JSON.stringify(content)],
+   ).catch((e) => console.error('[orchestrator] alert log failed', e.message));
+ }
+
 function signToken(user) {
   return jwt.sign({ sub: user.id, email: user.email, role: user.role }, config.JWT_SECRET, {
     expiresIn: config.JWT_EXPIRES_IN,
